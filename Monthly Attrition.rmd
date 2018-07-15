@@ -1,0 +1,503 @@
+---
+title: "Attrition Analysis"
+author: "Marketing Analytics"
+date: "December 14, 2016"
+output:
+  html_document:
+    depth: 3
+    highlight: tango
+    number_sections: yes
+    theme: cosmo
+    toc: yes
+  pdf_document:
+    fig_caption: yes
+    toc: yes
+geometry: margin=0.5in
+fontsize: 11pt
+---
+```{r Code Block 1,results='hide',include=FALSE}
+require(knitr)
+require(readr)
+require(dplyr)
+require(tidyr)
+require(stringr)
+require(ggplot2)
+require(lubridate)
+require(scales)
+require(RColorBrewer)
+require(forecast)
+require(ggseas)
+require(ggsdc)
+require(knitr)
+
+funggcast<-function(dn,fcast){ 
+  require(zoo) #needed for the 'as.yearmon()' function
+  
+  en<-max(time(fcast$mean)) #extract the max date used in the forecast
+  
+  #Extract Source and Training Data
+  ds<-as.data.frame(window(dn,end=en))
+  names(ds)<-'observed'
+  ds$date<-as.Date(time(window(dn,end=en)))
+  
+  #Extract the Fitted Values (need to figure out how to grab confidence intervals)
+  dfit<-as.data.frame(fcast$fitted)
+  dfit$date<-as.Date(time(fcast$fitted))
+  names(dfit)[1]<-'fitted'
+  
+  ds<-merge(ds,dfit,all.x=T) #Merge fitted values with source and training data
+  
+  #Exract the Forecast values and confidence intervals
+  dfcastn<-as.data.frame(fcast)
+  dfcastn$date<-as.Date(as.yearmon(row.names(dfcastn)))
+  names(dfcastn)<-c('forecast','lo80','hi80','lo95','hi95','date')
+  
+  pd<-merge(ds,dfcastn,all.x=T) #final data.frame for use in ggplot
+  return(pd)
+  
+}
+
+if(!exists("load_themes")) source("C:/Users/babbenante/OneDrive - Avis Budget Group/My Stuff/code/utils/themes.r")
+
+
+MemberSnapshot <- read_delim("C:/Users/babbenante/OneDrive - Avis Budget Group/My Stuff/Data/Attrition/MonthlyAttrition.txt"
+                             ,"\t")
+
+MemberSnapshot$SnapYear<-as.numeric(str_sub(MemberSnapshot$MEMBER_YM,1,4))
+MemberSnapshot$SnapMonth<-as.numeric(str_sub(MemberSnapshot$MEMBER_YM,-2,-1))
+MemberSnapshot$Snapshot<-as_date(paste0(MemberSnapshot$SnapYear,"-",MemberSnapshot$SnapMonth,"-1"))
+
+
+
+MemberSnapshot$SnapYear<-as.numeric(str_sub(MemberSnapshot$MEMBER_YM,1,4))
+MemberSnapshot$SnapMonth<-as.numeric(str_sub(MemberSnapshot$MEMBER_YM,-2,-1))
+MemberSnapshot$Snapshot<-as_date(paste0(MemberSnapshot$SnapYear,"-",MemberSnapshot$SnapMonth,"-1"))
+
+#summarise by month
+MemberSummary.all<-MemberSnapshot%>%
+  group_by(Snapshot)%>%
+  summarise(TotalMembers=sum(TOTAL_MEMBERS,na.rm=TRUE)
+            ,TotalLeavers=sum(LEAVING_MEMBERS,na.rm=TRUE)
+            ,churnRate=TotalLeavers/TotalMembers)%>%
+  filter(Snapshot!= as.Date("2017-03-01"))
+
+
+#test/train/validate data sets
+MemberSummary.train<-MemberSummary.all%>%
+  filter(Snapshot< as.Date("2015-01-01"))
+
+MemberSummary.test<-MemberSummary.all%>%
+  filter(Snapshot< as.Date("2016-01-01") & Snapshot>= as.Date("2015-01-01"))
+
+MemberSummary.final.train<-MemberSummary.all%>%
+  filter(Snapshot<= as.Date("2016-06-01"))
+
+MemberSummary.final.test<-MemberSummary.all%>%
+  filter(Snapshot> as.Date("2016-06-01"))
+
+
+
+mem.sample.train<-MemberSnapshot%>%
+  filter(SnapYear<2015)%>%
+  group_by(MEMBER_YM,FEE_FREQ,SEGMENT_CLASS)%>%
+  summarise(TotalMembers=sum(TOTAL_MEMBERS,na.rm=TRUE)
+            ,TotalLeavers=sum(LEAVING_MEMBERS,na.rm=TRUE))%>%
+  gather(variable, value, -(MEMBER_YM:SEGMENT_CLASS)) %>%
+  tbl_df%>%
+  unite(temp, SEGMENT_CLASS, FEE_FREQ, variable) %>%
+  spread(temp, value)%>%
+  mutate(TotalLeavers=Business_annual_TotalLeavers+Business_monthly_TotalLeavers+Collegiate_annual_TotalLeavers+Collegiate_monthly_TotalLeavers+Consumer_annual_TotalLeavers+Consumer_monthly_TotalLeavers+Consumer_bimonthly_TotalLeavers
+         ,TotalMembers=Business_annual_TotalMembers+Business_monthly_TotalMembers+Collegiate_annual_TotalMembers+Collegiate_monthly_TotalMembers+Consumer_annual_TotalMembers+Consumer_monthly_TotalMembers+Consumer_bimonthly_TotalMembers
+         ,ChurnRate=TotalLeavers/TotalMembers
+         ,BusShare=(Business_monthly_TotalMembers+Business_annual_TotalMembers)/TotalMembers
+         ,ConShare=(Consumer_monthly_TotalMembers+Consumer_annual_TotalMembers+Consumer_bimonthly_TotalMembers)/TotalMembers
+         ,CollShare=(Collegiate_monthly_TotalMembers+Collegiate_annual_TotalMembers)/TotalMembers
+         ,MonthlyShare=(Business_monthly_TotalMembers+Collegiate_monthly_TotalMembers+Consumer_monthly_TotalMembers)/TotalMembers)%>%
+  select(MEMBER_YM,ChurnRate,TotalMembers,TotalLeavers,ConShare,CollShare,BusShare,MonthlyShare)
+
+xreg.train <- cbind(TotalMem=mem.sample.train$TotalMembers
+              ,ConShare=mem.sample.train$ConShare
+              ,CollShare=mem.sample.train$CollShare
+              ,BusShare=mem.sample.train$BusShare
+              ,MonthlyShare=mem.sample.train$MonthlyShare)
+
+mem.sample.test<-MemberSnapshot%>%
+  filter(SnapYear<2015)%>%
+  group_by(MEMBER_YM,FEE_FREQ,SEGMENT_CLASS)%>%
+  summarise(TotalMembers=sum(TOTAL_MEMBERS,na.rm=TRUE)
+            ,TotalLeavers=sum(LEAVING_MEMBERS,na.rm=TRUE))%>%
+  gather(variable, value, -(MEMBER_YM:SEGMENT_CLASS)) %>%
+  tbl_df%>%
+  unite(temp, SEGMENT_CLASS, FEE_FREQ, variable) %>%
+  spread(temp, value)%>%
+  mutate(TotalLeavers=Business_annual_TotalLeavers+Business_monthly_TotalLeavers+Collegiate_annual_TotalLeavers+Collegiate_monthly_TotalLeavers+Consumer_annual_TotalLeavers+Consumer_monthly_TotalLeavers+Consumer_bimonthly_TotalLeavers
+         ,TotalMembers=Business_annual_TotalMembers+Business_monthly_TotalMembers+Collegiate_annual_TotalMembers+Collegiate_monthly_TotalMembers+Consumer_annual_TotalMembers+Consumer_monthly_TotalMembers+Consumer_bimonthly_TotalMembers
+         ,ChurnRate=TotalLeavers/TotalMembers
+         ,BusShare=(Business_monthly_TotalMembers+Business_annual_TotalMembers)/TotalMembers
+         ,ConShare=(Consumer_monthly_TotalMembers+Consumer_annual_TotalMembers+Consumer_bimonthly_TotalMembers)/TotalMembers
+         ,CollShare=(Collegiate_monthly_TotalMembers+Collegiate_annual_TotalMembers)/TotalMembers
+         ,MonthlyShare=(Business_monthly_TotalMembers+Collegiate_monthly_TotalMembers+Consumer_monthly_TotalMembers)/TotalMembers)%>%
+  select(MEMBER_YM,ChurnRate,TotalMembers,TotalLeavers,ConShare,CollShare,BusShare,MonthlyShare)
+
+xreg.test <- cbind(TotalMem=mem.sample.test$TotalMembers
+                    ,ConShare=mem.sample.test$ConShare
+                    ,CollShare=mem.sample.test$CollShare
+                    ,BusShare=mem.sample.test$BusShare
+                    ,MonthlyShare=mem.sample.test$MonthlyShare)
+
+myts.train <- ts(MemberSummary.train$TotalLeavers, start=c(2011, 1), end=c(2014, 12), frequency=12)
+myts.test <- ts(MemberSummary.test$TotalLeavers, start=c(2015, 1), end=c(2015, 12), frequency=12)
+
+
+fit1.leavers <- ets(myts.train,model="ZZZ")
+fit2.leavers <- ets(myts.train,model="MMM")
+fit3.leavers <- stl(myts.train, s.window="periodic")
+fit4.leavers <- auto.arima(myts.train)
+fcast1.leavers <- forecast(fit1.leavers, h=12)
+fcast2.leavers <- forecast(fit2.leavers, h=12)
+fcast3.leavers <- forecast(fit3.leavers, h=12)
+fcast4.leavers <- forecast(fit4.leavers, h=12)
+results1.leavers<-accuracy(fcast1.leavers,myts.test)
+results2.leavers<-accuracy(fcast2.leavers,myts.test)
+results3.leavers<-accuracy(fcast3.leavers,myts.test)
+results4.leavers<-accuracy(fcast4.leavers,myts.test)
+results1.leavers
+results3.leavers
+results3.leavers
+results4.leavers
+
+```
+<style type="text/css">
+p.caption
+{
+float:right; 
+margin: auto;
+padding:2px; 
+clear:both;
+}
+</style>
+#Executive Summary
+
+This is an analysis of attrition trends for Zipcar North America, ostensibly to provide context to whatever (if any) effect the introduction of online self-close has had on attrition.  It is not intended to make any inference on the value of self-close - rather it can be used in conjunction with other data points and analyses to make a determination on the self-close initiative.
+
+Both raw attrition and churn were examined.  Time series models were fitted for each KPI and retroactively 'forecast' over the past half year to determine if either measure exhibited unexpected behavior that could potentially be associated with self close.  August 1st is used as the timeframe to determine pre/post self-close behavior.
+
+After reviewing the data it does not appear that self-close has significant causal impact on either the raw number of monthly attriting members or the churn rate.  While there was a noticeable increase in both the month directly after implementation, the results are within the acceptable parameters of variance for what was expected.  Additionally, subsequent months (September 2016-November 2016) show no indications of an above average trend and are actually trending under the forecast.  I would be hesitant to make any judgements at this point, as there is quite a bit of noise in the attrition data in general - and would recommend gathering additional data points if a definitive opinion on self-close impact is warranted.  If that is not an option, and this is the entirity of the data, I tend to lean towards August being more of an outlier than an indicator.  
+
+
+#Data Exploration
+
+```{r Code Block 2, echo=FALSE, fig.width=4, fig.height=2,fig.cap=c('fig 1','fig 2','fig 3'), message=FALSE, warning=FALSE,out.extra='style="float:right; margin: auto;padding:2px; clear:both; "'}
+ggplot(MemberSummary.all, aes(y=TotalMembers,x=Snapshot)) +
+#  geom_area(binwidth=1,fill="#51a601", alpha=0.75) +
+  geom_area(fill="#51a601", alpha=0.75) +
+  fte_theme() +
+  labs(title="Members by Month ", x="Date", y="Count of Members") +
+  scale_x_date(labels=date_format("%Y/%m")) +
+  scale_y_continuous(labels=comma) + 
+  geom_hline(yintercept=0, size=0.4, color="black") +
+  geom_vline(aes(xintercept=as.numeric(Snapshot[c(68)])),
+             linetype=4, colour="black")
+
+ggplot(MemberSummary.all, aes(y=TotalLeavers,x=Snapshot)) +
+#  geom_area(binwidth=1,fill="#51a601", alpha=0.75) +
+  geom_area(fill="#51a601", alpha=0.75) +
+  fte_theme() +
+  labs(title="Leavers by Month ", x="Date", y="Count of Members") +
+  scale_x_date(labels=date_format("%Y/%m")) +
+  scale_y_continuous(labels=comma) + 
+  geom_hline(yintercept=0, size=0.4, color="black") +
+  geom_vline(aes(xintercept=as.numeric(Snapshot[c(68)])),
+             linetype=4, colour="black")
+
+ggplot(MemberSummary.all, aes(y=churnRate,x=Snapshot)) +
+#  geom_area(binwidth=1,fill="#51a601", alpha=0.75) +
+  geom_area(fill="#51a601", alpha=0.75) +  
+  fte_theme() +
+  labs(title="Churn by Month ", x="Date", y="Churn Rate") +
+  scale_x_date(labels=date_format("%Y/%m")) +
+  scale_y_continuous(labels=comma) + 
+  geom_hline(yintercept=0, size=0.4, color="black") +
+  geom_vline(aes(xintercept=as.numeric(Snapshot[c(68)])),
+             linetype=4, colour="black")
+
+```
+
+The period covered in the analysis is January, 2011 through November 2016. Monthly counts of members  were retrieved from the Datashed member month details view. Attriting members were derived from the Datashed account driver activity table. With the benefit of hindsight, only a member's final leave date qualified as a leaving member. As a result more recent months would be (potentially) penalized as 'habitual' rejoiners would be discounted as attriting from earlier observational periods. If further analysis is warranted, each intermittent leave could be considered in it's relevant time frame.
+
+Overall membership growth for North America is graphed in Figure 1. The trend line is linear in nature, although it has flattened out in recent years. There is a slight yearly seasonal trend that is generally masked by size of the established member base. The dotted black line bisecting the chart indicates August of 2016. 
+
+The number of monthly leaving members, and the monthly churn rate, are shown in the next two graphs (Figs. 2-3).  Two things of note on these numbers:
+
+1. The month to month variance (reflected in both measures) is much higher.  Churn rate effectively mirrors Attriting members - this is unsuprising given the relative consistent nature of the denominator (Total members). You can see some of the variance tamped down out of the churn rate compared to leaving members as the total member base grows.
+2. A definitive spike in August 2016 that matches the launch of self-close.  While there are are YoY growth as well as seasonal trends evident in both metrics, The increase at this point is particularly noticeable.
+
+Given the trends indicated in the attrition data, a basic decomposition of the time series using moving averages was generated (fig 4).  There are four parts to this chart
+
+1. Observed - The time series chart of leaving members (same as fig. 2)
+2. Trend - The yearly trend line for the data
+3. Seasonal - The seasonal pattern of leaving members
+4. Irregular - The difference between the observed data and what is accounted for by the Trend and Seasonal components.
+
+In other words - if we had a simple two part moving average model, the fourth chart indicates how wrong the model is eveyr month.  Again, the largest (positive) variance is seen in August 2016.  However, it is of note that for subsequent months the error rate is actually below expected totals.  
+
+<br style="clear:both" />
+
+```{r Code Block 3, echo=FALSE, fig.width=8, fig.height=3.5,fig.cap='fig 4', message=FALSE, warning=FALSE,out.extra='style="float:left;margin: auto;padding:2px; clear:both; "'}
+
+ggsdc(MemberSummary.all, aes(x = Snapshot, y = TotalLeavers),
+      method = "stl", s.window="periodic" ,start = c(2012,1), frequency = 12) +
+  geom_line(color="#51a601") +
+  labs(x = "   \n  ", colour = "") +
+  scale_y_continuous("Leaving Members", label = comma) +
+  scale_x_date(labels=date_format("%Y/%m"),date_breaks = "6 months") +
+  ggtitle("Zipcar Attrition Seasonal Trends Decomposition") +
+  fte_theme()+
+  theme(axis.text.x=element_text(size=6))
+```
+<br style="clear:both" />
+
+#Methodology
+
+Given that the simple univariate moving average model explains a good portion of the variance, a series of more complex time series models are fit to see if there is a more complete model.  Data from 2011 to 2014 is used to train the models, and  fit is measured on the accuracy of the predictions for 2015.  The best model type - using Mean Absolute Error - is chosen, and the winning model is retrained on data from 2011 through Jun of 2016.  This model is then be used to predict July 2016 through November 2016, and measure actual results and error terms against prediction to look for outliers or unexpected variance.  The same process will be used for Leaving members and churn rate.
+
+#Leaving Members Modeling
+
+##Initial Modeling Results
+```{r Code Block 4,echo=FALSE,message=FALSE, warning=FALSE,results='asis'}
+fit1.leavers <- ets(myts.train,model="ZZZ")
+fit2.leavers <- ets(myts.train,model="MMM")
+fit3.leavers <- stl(myts.train, s.window="periodic")
+fit4.leavers <- auto.arima(myts.train)
+fcast1.leavers <- forecast(fit1.leavers, h=12)
+fcast2.leavers <- forecast(fit2.leavers, h=12)
+fcast3.leavers <- forecast(fit3.leavers, h=12)
+fcast4.leavers <- forecast(fit4.leavers, h=12)
+results1.leavers<-accuracy(fcast1.leavers,myts.test)
+results2.leavers<-accuracy(fcast2.leavers,myts.test)
+results3.leavers<-accuracy(fcast3.leavers,myts.test)
+results4.leavers<-accuracy(fcast4.leavers,myts.test)
+```
+The results from the initial modeling run can be seen in the table below (Fig 5).  The Holt Winters Multiplicative model was the best fitting model, with a MAE of `r round(results1.leavers['Training set','MAE'],1)` on the training dataset and `r round(results1.leavers['Test set','MAE'],1)` on the test dataset.  
+```{r Code Block 5,echo=FALSE,message=FALSE, warning=FALSE,results='asis'}
+results.Type<-c('MAM','MMM','stl','arima')
+results.MAE<-c(results1.leavers['Test set','MAE'],results2.leavers['Test set','MAE'],results3.leavers['Test set','MAE'],results4.leavers['Test set','MAE'])
+results.df<-data.frame(results.Type,results.MAE)
+
+kable(results.df,col.names = c('Model Type','Mean Absolute Error'),caption='fig 5')
+```
+
+The fit of the winning model and associated confidence intervals for the test data set can be seen in Figure 6.
+
+```{r Code Block 6, echo=FALSE, fig.width=8, fig.height=3.5,fig.cap='fig 6', message=FALSE, warning=FALSE,out.extra='style="float:left;margin: auto;padding:2px; clear:both; "'}
+
+pd<-funggcast(myts.test,fcast1.leavers)
+
+
+ggplot(pd,aes(x=date,y=observed)) +
+  fte_theme() +
+  geom_line(aes(y=observed,color="Actual")) +
+  geom_line(aes(y=forecast,color="Forecast")) +
+  scale_color_manual(values=c("Actual"="#51a601"
+                              ,"Forecast"="#E87709")) +
+  #  geom_line(aes(y=forecast)) +
+  geom_ribbon(aes(ymin=lo80,ymax=hi80),alpha=.25) +
+  scale_x_date(labels=date_format("%Y/%m")) +
+  #  scale_y_continuous(labels = scales::percent) + 
+  scale_y_continuous(labels=comma) + 
+  labs(title="Forecasted vs Actual Attrition, 2015", x="Date", y="Leaving Members") +
+  theme(legend.title=element_blank(),legend.text=element_text(size=5),legend.position='bottom') 
+```
+<br style="clear:both" />
+
+##Final Modeling Results
+```{r Code Block 7, echo=FALSE, message=FALSE, warning=FALSE}
+
+myts.train <- ts(MemberSummary.final.train$TotalLeavers, start=c(2011, 1), end=c(2016, 6), frequency=12)
+myts.test <- ts(MemberSummary.final.test$TotalLeavers, start=c(2016, 7), end=c(2016, 12), frequency=12)
+
+fit.final.leavers <- ets(myts.train,model="MAM")
+fcast.final.leavers <- forecast(fit.final.leavers, h=6)
+results.final.leavers<-accuracy(fcast.final.leavers,myts.test)
+```
+The winning model was refit and had a MAE of `r round(results.final.leavers['Training set','MAE'],1)` on the training dataset.  The MAE on the test dataset was `r round(results.final.leavers['Test set','MAE'],1)`.  
+
+
+
+```{r Code Block 8, echo=FALSE, fig.width=8, fig.height=3.5,fig.cap='fig 7', message=FALSE, warning=FALSE,out.extra='style="float:left;margin: auto;padding:2px; clear:both; "'}
+
+pd<-funggcast(myts.test,fcast.final.leavers)
+
+
+ggplot(pd,aes(x=date,y=observed)) +
+  fte_theme() +
+  geom_line(aes(y=observed,color="Actual")) +
+  geom_line(aes(y=forecast,color="Forecast")) +
+  scale_color_manual(values=c("Actual"="#51a601"
+                              ,"Forecast"="#E87709")) +
+  #  geom_line(aes(y=forecast)) +
+  geom_ribbon(aes(ymin=lo80,ymax=hi80),alpha=.25) +
+  scale_x_date(labels=date_format("%Y/%m")) +
+  #  scale_y_continuous(labels = scales::percent) + 
+  scale_y_continuous(labels=comma) + 
+  labs(title="Forecasted vs Actual Attrition, Jul-Dec 2016", x="Date", y="Leaving Members") +
+  theme(legend.title=element_blank(),legend.text=element_text(size=5),legend.position='bottom') 
+```
+<br style="clear:both" />
+
+
+
+
+#Churn Modeling
+
+##Initial Modeling Results
+```{r Code Block 9,echo=FALSE,message=FALSE, warning=FALSE,results='asis'}
+myts.train <- ts(MemberSummary.train$churnRate, start=c(2011, 1), end=c(2014, 12), frequency=12)
+myts.test <- ts(MemberSummary.test$churnRate, start=c(2015, 1), end=c(2015, 12), frequency=12)
+
+
+fit1.churn <- ets(myts.train,model="ZZZ")
+fit2.churn <- ets(myts.train,model="MMM")
+fit3.churn <- stl(myts.train, s.window="periodic")
+fit4.churn <- auto.arima(myts.train)
+fit5.churn <- auto.arima(myts.train, xreg=xreg.train,d=0,D=0)
+fcast1.churn <- forecast(fit1.churn, h=12)
+fcast2.churn <- forecast(fit2.churn, h=12)
+fcast3.churn <- forecast(fit3.churn, h=12)
+fcast4.churn <- forecast(fit4.churn, h=12)
+fcast5.churn <- forecast(fit5.churn, xreg=xreg.test,h=12)
+results1.churn<-accuracy(fcast1.churn,myts.test)
+results2.churn<-accuracy(fcast2.churn,myts.test)
+results3.churn<-accuracy(fcast3.churn,myts.test)
+results4.churn<-accuracy(fcast4.churn,myts.test)
+results5.churn<-accuracy(fcast5.churn,myts.test)
+results.Type<-c('MAM','MMM','stl','arima','multi')
+results.MAE<-c(results1.churn['Test set','MAE'],results2.churn['Test set','MAE'],results3.churn['Test set','MAE'],results4.churn['Test set','MAE'],results5.churn['Test set','MAE'])
+
+```
+The results from the initial modeling run can be seen in the table below (Fig 8).  An additional model type was introduced into this round: a multivariate time series was used to try and draw out the effects on the change in member base composition (specifically the increase of Uni as a share of total members). An Exponential Triple Smoothing model was the best fitting model, with a MAE of `r round(results2.churn['Training set','MAE'],4)` on the training dataset and `r round(results2.churn['Test set','MAE'],4)` on the test dataset.  
+```{r Code Block 10,echo=FALSE,message=FALSE, warning=FALSE,results='asis'}
+results.df<-data.frame(results.Type,results.MAE)
+
+kable(results.df,col.names = c('Model Type','Mean Absolute Error'),caption='fig 8')
+```
+
+The fit of the winning model and associated confidence intervals for the test data set can be seen in Figure 9
+
+```{r Code Block 11, echo=FALSE, fig.width=8, fig.height=3.5,fig.cap='fig 9', message=FALSE, warning=FALSE,out.extra='style="float:left;margin: auto;padding:2px; clear:both; "'}
+
+rm(pd)
+pd<-funggcast(myts.test,fcast2.churn)
+
+
+ggplot(pd,aes(x=date,y=observed)) +
+  fte_theme() +
+  geom_line(aes(y=observed,color="Actual")) +
+  geom_line(aes(y=forecast,color="Forecast")) +
+  scale_color_manual(values=c("Actual"="#51a601"
+                              ,"Forecast"="#E87709")) +
+  #  geom_line(aes(y=forecast)) +
+  geom_ribbon(aes(ymin=lo80,ymax=hi80),alpha=.25) +
+  scale_x_date(labels=date_format("%Y/%m")) +
+  scale_y_continuous(labels = scales::percent) + 
+  #scale_y_continuous(labels=comma) + 
+  labs(title="Forecasted vs Actual Attrition, 2015", x="Date", y="Leaving Members") +
+  theme(legend.title=element_blank(),legend.text=element_text(size=5),legend.position='bottom') 
+ 
+```
+<br style="clear:both" />
+
+##Final Modeling Results
+```{r Code Block 12, echo=FALSE, message=FALSE, warning=FALSE}
+
+myts.train <- ts(MemberSummary.final.train$churnRate, start=c(2011, 1), end=c(2016, 6), frequency=12)
+myts.test <- ts(MemberSummary.final.test$churnRate, start=c(2016, 7), end=c(2017, 2), frequency=12)
+
+fit.final.churn <- ets(myts.train,model="MMM")
+fcast.final.churn <- forecast(fit.final.churn, h=8)
+results.final.churn<-accuracy(fcast.final.churn,myts.test)
+
+```
+The winning model was refit and had a MAE of `r percent(round(results.final.churn['Training set','MAE'],4))` on the training dataset.  The MAE on the test dataset was `r percent(round(results.final.churn['Test set','MAE'],4))`.  
+
+```{r Code Block 13, echo=FALSE, fig.width=8, fig.height=3.5,fig.cap='fig 11', message=FALSE, warning=FALSE,out.extra='style="float:left;margin: auto;padding:2px; clear:both; "'}
+
+#rm(pd)
+pd<-funggcast(myts.test,fcast.final.churn)
+
+
+ggplot(pd,aes(x=date,y=observed)) +
+  fte_theme() +
+  geom_line(aes(y=observed,color="Actual")) +
+  geom_line(aes(y=forecast,color="Forecast")) +
+  scale_color_manual(values=c("Actual"="#51a601"
+                              ,"Forecast"="#E87709")) +
+  #  geom_line(aes(y=forecast)) +
+  geom_ribbon(aes(ymin=lo80,ymax=hi80),alpha=.25) +
+  scale_x_date(labels=date_format("%Y/%m")) +
+  scale_y_continuous(labels = scales::percent) + 
+  #scale_y_continuous(labels=comma) + 
+  labs(title="Forecasted vs Actual Attrition, Jul-Feb 2017", x="Date", y="Leaving Members") +
+  theme(legend.title=element_blank(),legend.text=element_text(size=5),legend.position='bottom') 
+```
+<br style="clear:both" />
+
+#Conclusions
+
+Results are within the normal bounds of expectations for both Total Monthly Leavers, as well as churn rate.  While August 2016 saw elevated results, the attrition numbers stabilize for the remaining observation periods.  All results are within acceptable error limits. Speaking extemporaneously, you could potentially slice this data up into various 2 or 3 year views and get a variety of results.  That is, 2015 appears to be somewhat of an outlier in terms of attrition performance, and the growth rate for 2011-2013 is not reflective of the current state. Additionally, a multivariate model was attempted as an alternative to the univariate time series to determine if using business unit share and size was a more accurate predictor vs. the trend and seasonal data used by the various time series algorithms (it was not).
+
+Long term I would suggest not using a time series model as a final predictor, but rather build a traditional independent linear regression model (with a time series model as a potential input) to attempt to predict attrition. There are a multitude of potential predictors that are unaccounted for in this quick modeling exercise, and a full data discovery should be undertaken to create a more comprehensive model.
+
+#Appendix A - Sql queries
+
+with Leaving_Members as 
+(
+select to_char(ada.adm_date,'YYYY-MM') as leaving_ym
+,rpc.segment_class
+,rpc.plan_name
+,rpc.fee_freq
+,zf.level_5_key as zipfleet 
+,count(*) as leaving_members
+from account_driver_activity ada
+join zipfleet_rollups zf 
+    on ada.last_left_zipfleet_id=zf.rollup_id
+    and zf.level_3_key='continent_north_america'
+JOIN analytics.rate_plan_cat rpc
+    on ada.prior_rate_plan_id = rpc.rate_plan_id
+where action='left' and account_count = 0 and adm_date > date '2011-01-01'
+group by to_char(ada.adm_date,'YYYY-MM')
+,rpc.segment_class
+,rpc.plan_name
+,rpc.fee_freq
+,zf.level_5_key 
+) ,
+total_members as
+(
+select to_char(mmd.month,'YYYY-MM') as member_ym
+,rpc.segment_class
+,rpc.plan_name
+,rpc.fee_freq
+,zf.level_5_key as zipfleet 
+,count(*) as total_members 
+from v_member_month_details mmd 
+join zipfleet_rollups zf 
+    on mmd.joined_zipfleet_id=zf.rollup_id
+    and zf.level_3_key='continent_north_america'
+JOIN analytics.rate_plan_cat rpc
+    on mmd.join_rate_plan_id = rpc.rate_plan_id
+where month>= date '2011-01-01'
+group by to_char(mmd.month,'YYYY-MM') 
+,rpc.segment_class
+,rpc.plan_name
+,rpc.fee_freq
+,zf.level_5_key
+)
+
+select tm.*
+,lm.leaving_members
+ from total_members tm
+left join leaving_members lm
+    on tm.member_ym=lm.leaving_ym
+    and tm.segment_class=lm.segment_class
+    and tm.plan_name=lm.plan_name
+    and tm.zipfleet=lm.zipfleet
